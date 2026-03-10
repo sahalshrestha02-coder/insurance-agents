@@ -1,5 +1,4 @@
 # main.py
-from typing import Dict, Any, List
 from langgraph.graph import StateGraph, START, END
 from agents import (
     AgentState, 
@@ -7,10 +6,20 @@ from agents import (
     strategy_node, 
     email_agent_node, 
     voice_agent_node, 
-    whatsapp_agent_node,
-    guardrail_agent_node,
+    whatsapp_agent_node, 
+    guardrail_agent_node, 
     hitl_node
 )
+from logging_config import get_logger
+
+logger = get_logger(__name__)
+
+# Router for guardrail
+def guardrail_router(state: AgentState):
+    if state["guardrail_status"] == "APPROVED":
+        return "end"
+    else:
+        return "hitl"
 
 # Initialize the state graph
 workflow = StateGraph(AgentState)
@@ -29,29 +38,22 @@ workflow.add_edge(START, "data_retrieval")
 workflow.add_edge("data_retrieval", "strategy")
 
 # Conditional edges from strategy
-def router(state: AgentState):
-    return state["next_node"]
-
 workflow.add_conditional_edges(
     "strategy",
-    router,
+    lambda x: x["next_node"],
     {
         "email": "email",
-        "voice": "voice",
         "whatsapp": "whatsapp",
+        "voice": "voice",
         "hitl": "hitl"
     }
 )
 
-# Guardrail routing
-def guardrail_router(state: AgentState):
-    if state["guardrail_status"] == "APPROVED":
-        return "end"
-    else:
-        return "hitl"
-
+# Edges to guardrail (for asynchronous channels)
 workflow.add_edge("email", "guardrail")
 workflow.add_edge("whatsapp", "guardrail")
+
+# Conditional edges from guardrail
 workflow.add_conditional_edges(
     "guardrail",
     guardrail_router,
@@ -61,15 +63,15 @@ workflow.add_conditional_edges(
     }
 )
 
-# End edges
+# Final edges to end
 workflow.add_edge("voice", END)
 workflow.add_edge("hitl", END)
 
 # Compile the graph
 app = workflow.compile()
 
-def run_automation(ph_id: str):
-    print(f"\n--- PROCESSING AUTOMATION FOR {ph_id} ---")
+async def run_automation(ph_id: str):
+    logger.info(f"--- STARTING ASYNC AUTOMATION FOR {ph_id} ---")
     initial_state = {
         "messages": [],
         "policyholder_id": ph_id,
@@ -80,15 +82,15 @@ def run_automation(ph_id: str):
         "guardrail_status": ""
     }
     
-    # Run the graph
-    for output in app.stream(initial_state):
-        # Optional: Print intermediate state for debugging
-        # print(output)
+    # Run the graph asynchronously
+    async for output in app.astream(initial_state):
+        if "__metadata__" in output:
+            continue
+        # Intermediate logging if needed
         pass
-
+    logger.info(f"--- COMPLETED AUTOMATION FOR {ph_id} ---")
+    
 if __name__ == "__main__":
-    # Test with different policyholders to verify time-based thresholds
-    run_automation("PH_EMAIL")    # 30 days -> Email -> Critic
-    run_automation("PH_WHATSAPP") # 15 days -> WhatsApp -> Critic
-    run_automation("PH_VOICE")    # 7 days -> Voice
-    run_automation("PH_HITL")     # 2 days -> HITL
+    # For local testing, we'd need a runner but we'll use API primarily
+    import asyncio
+    asyncio.run(run_automation("PH_EMAIL"))

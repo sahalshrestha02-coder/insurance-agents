@@ -1,21 +1,36 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from main import run_automation
-from db import get_policyholder, POLICYHOLDERS
+from db import get_policyholder, list_policyholders_async, init_db
 from pydantic import BaseModel
 from typing import List, Optional
 import os
-from langchain_google_genai import ChatGoogleGenerativeAI
+import logging
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_chroma import Chroma
 from dotenv import load_dotenv
+from logging_config import setup_logging, get_logger
+
+# Initialize logging
+setup_logging()
+logger = get_logger(__name__)
 
 load_dotenv()
 
 app = FastAPI(title="Insurance Renewal Automation API")
 
-# CORS middleware for frontend communication
+# Global Exception Handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"message": "Internal Server Error", "detail": str(exc)},
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,11 +48,16 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 # LLM for chatbot
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=os.getenv("GEMINI_API_KEY"))
 
-# Policy context from POLICY.md
-POLICY_CONTEXT = ""
-policy_path = pathlib.Path(__file__).parent / "POLICY.md"
-if policy_path.exists():
-    POLICY_CONTEXT = policy_path.read_text()
+# Initialize Vector Store for RAG
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="models/gemini-embedding-001",
+    google_api_key=os.getenv("GEMINI_API_KEY")
+)
+vector_db = Chroma(
+    persist_directory="chroma_db",
+    embedding_function=embeddings
+)
+retriever = vector_db.as_retriever(search_kwargs={"k": 3})
 
 class PolicyholderResponse(BaseModel):
     id: str
@@ -57,21 +77,28 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
 
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+    logger.info("Application startup: Database initialized.")
+
 @app.get("/")
-def serve_frontend():
+async def serve_frontend():
     index_file = static_dir / "index.html"
     if index_file.exists():
         return FileResponse(str(index_file))
     return {"message": "Insurance Renewal Automation API is running"}
 
 @app.get("/policyholders")
-def list_policyholders():
-    return {"policyholders": list(POLICYHOLDERS.values())}
+async def list_policyholders():
+    phs = await list_policyholders_async()
+    return {"policyholders": phs}
 
 @app.get("/dashboard/stats")
-def get_stats():
+async def get_stats():
     stats = {"EMAIL_SENT": 0, "WHATSAPP_SENT": 0, "VOICE_CALL_MADE": 0, "ESCALATED": 0, "PENDING": 0}
-    for ph in POLICYHOLDERS.values():
+    phs = await list_policyholders_async()
+    for ph in phs:
         status = ph.get("renewal_status", "PENDING")
         if status in stats:
             stats[status] += 1
@@ -80,43 +107,42 @@ def get_stats():
     return stats
 
 @app.post("/renew/{policyholder_id}")
-def trigger_renewal(policyholder_id: str):
-    ph_data = get_policyholder(policyholder_id)
+async def trigger_renewal(policyholder_id: str):
+    ph_data = await get_policyholder(policyholder_id)
     if not ph_data:
         raise HTTPException(status_code=404, detail=f"Policyholder {policyholder_id} not found")
-    try:
-        run_automation(policyholder_id)
-        updated_data = get_policyholder(policyholder_id)
-        return {"status": "success", "data": updated_data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    
+    logger.info(f"API: Triggering renewal for {policyholder_id}")
+    await run_automation(policyholder_id)
+    
+    updated_data = await get_policyholder(policyholder_id)
+    return {"status": "success", "data": updated_data}
 
 @app.get("/policyholder/{policyholder_id}", response_model=PolicyholderResponse)
-def get_status(policyholder_id: str):
-    ph_data = get_policyholder(policyholder_id)
+async def get_status(policyholder_id: str):
+    ph_data = await get_policyholder(policyholder_id)
     if not ph_data:
         raise HTTPException(status_code=404, detail=f"Policyholder {policyholder_id} not found")
     return ph_data
 
 @app.post("/chat", response_model=ChatResponse)
-def chat_with_policy(request: ChatRequest):
-    system_prompt = f"""You are a helpful insurance policy assistant for our company. 
-Answer questions based on the following company policy document. Be concise and friendly.
-
-POLICY DOCUMENT:
-{POLICY_CONTEXT}
-
-If the question is not related to the policy, politely redirect to policy topics."""
+async def chat_with_policy(request: ChatRequest):
+    logger.info(f"API Chat: {request.message}")
     
-    try:
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=request.message)
-        ])
-        return {"reply": response.content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Retrieve relevant context
+    docs = await retriever.ainvoke(request.message)
+    context = "\n\n".join([doc.page_content for doc in docs])
+    
+    from agents.utils import get_prompt
+    prompt_template = get_prompt("chatbot_rag.txt")
+    system_prompt = prompt_template.format(context=context)
+    
+    response = await llm.ainvoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=request.message)
+    ])
+    return {"reply": response.content}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=True)
